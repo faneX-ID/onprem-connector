@@ -1,0 +1,240 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_type:
+        description: 'Release Type'
+        required: true
+        default: 'stable'
+        type: choice
+        options:
+        - stable
+        - beta
+        - nightly
+      version_override:
+        description: 'Manual version (leave empty for auto-increment, e.g. 1.0.1). Do not add v in front.'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    outputs:
+      new_version: ${{ steps.version.outputs.version }}
+      commit_sha: ${{ steps.commit.outputs.commit_sha }}
+    steps:
+    - uses: actions/checkout@v5
+      with:
+        fetch-depth: 0
+        token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version: '3.12'
+
+    - name: Calculate Version
+      id: version
+      run: |
+        # Read current version from main.py or setup.py
+        if [ -f "main.py" ]; then
+          current=$(grep -oP 'version="[^"]*"' main.py | cut -d'"' -f2 || echo "1.0.0")
+        else
+          current="1.0.0"
+        fi
+
+        RELEASE_TYPE="${{ inputs.release_type }}"
+
+        if [ -n "${{ inputs.version_override }}" ]; then
+          new_version="${{ inputs.version_override }}"
+          if [ "$RELEASE_TYPE" == "beta" ] && [[ ! "$new_version" =~ -b ]]; then
+            new_version="${new_version}-b1"
+          elif [ "$RELEASE_TYPE" == "nightly" ] && [[ ! "$new_version" =~ -n ]]; then
+            new_version="${new_version}-n1"
+          fi
+        else
+          # Simple version increment
+          IFS='.' read -ra ADDR <<< "$current"
+          major=${ADDR[0]}
+          minor=${ADDR[1]}
+          patch=${ADDR[2]%%-*}  # Remove suffix if present
+
+          if [ "$RELEASE_TYPE" == "stable" ]; then
+            patch=$((patch + 1))
+            new_version="${major}.${minor}.${patch}"
+          elif [ "$RELEASE_TYPE" == "beta" ]; then
+            patch=$((patch + 1))
+            new_version="${major}.${minor}.${patch}-b1"
+          else
+            patch=$((patch + 1))
+            new_version="${major}.${minor}.${patch}-n1"
+          fi
+        fi
+
+        echo "Release Type: $RELEASE_TYPE"
+        echo "Current Version: $current"
+        echo "New Version: $new_version"
+        echo "version=$new_version" >> $GITHUB_OUTPUT
+        echo "NEW_VERSION=$new_version" >> $GITHUB_ENV
+
+    - name: Update Version & Commit
+      id: commit
+      run: |
+        git config --global user.name "github-actions[bot]"
+        git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+        # Update version in main.py if present
+        if [ -f "main.py" ]; then
+          sed -i "s/version=\"[^\"]*\"/version=\"${{ env.NEW_VERSION }}\"/" main.py || true
+        fi
+
+        # Update version in README if present
+        if [ -f "README.md" ]; then
+          sed -i "s/version = [0-9.]*/version = ${{ env.NEW_VERSION }}/" README.md || true
+        fi
+
+        git add -A
+        git commit -m "chore(release): bump version to ${{ env.NEW_VERSION }} [skip ci]" || echo "No changes to commit"
+        git push origin main || echo "Push failed or no changes"
+
+        echo "commit_sha=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+
+    - name: Get Last Stable Tag
+      id: last_stable
+      if: inputs.release_type == 'stable'
+      run: |
+        last_stable=$(git tag -l 'v*' | grep -vE '\-[nb]' | sort -V | tail -1 || echo "")
+        if [ -n "$last_stable" ]; then
+          echo "tag=$last_stable" >> $GITHUB_OUTPUT
+        else
+          echo "tag=" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Generate Changelog
+      id: changelog
+      uses: orhun/git-cliff-action@v4
+      with:
+        config: cliff.toml
+        args: ${{ steps.last_stable.outputs.tag != '' && format('--tag-pattern "v[0-9]*" {0}..HEAD --verbose', steps.last_stable.outputs.tag) || '--verbose' }}
+      env:
+        OUTPUT: CHANGELOG.md
+      continue-on-error: true
+
+    - name: Create Release
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: v${{ env.NEW_VERSION }}
+        name: Release v${{ env.NEW_VERSION }}
+        target_commitish: ${{ steps.commit.outputs.commit_sha }}
+        body_path: CHANGELOG.md
+        draft: false
+        prerelease: ${{ inputs.release_type != 'stable' }}
+
+  build-linux:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v5
+
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version: '3.12'
+
+    - name: Install Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pyinstaller
+
+    - name: Build Linux Binary
+      run: |
+        pyinstaller --onefile --name fanexid-connector main.py || echo "PyInstaller not configured, skipping binary build"
+
+    - name: Create Linux Archive
+      run: |
+        mkdir -p dist/connector-linux
+        cp -r main.py requirements.txt config.ini.example install.sh README.md LICENSE dist/connector-linux/ 2>/dev/null || true
+        if [ -f "dist/fanexid-connector" ]; then
+          cp dist/fanexid-connector dist/connector-linux/
+        fi
+        cd dist
+        tar -czf connector-linux.tar.gz connector-linux/
+
+    - name: Upload Linux Release Asset
+      uses: softprops/action-gh-release@v2
+      with:
+        files: dist/connector-linux.tar.gz
+        tag_name: v${{ needs.release.outputs.new_version }}
+
+  build-windows:
+    needs: release
+    runs-on: windows-latest
+    steps:
+    - uses: actions/checkout@v5
+
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version: '3.12'
+
+    - name: Install Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pyinstaller
+
+    - name: Build Windows Binary
+      run: |
+        pyinstaller --onefile --name fanexid-connector.exe main.py || echo "PyInstaller not configured, skipping binary build"
+
+    - name: Create Windows Archive
+      run: |
+        New-Item -ItemType Directory -Force -Path dist\connector-windows
+        Copy-Item main.py,requirements.txt,config.ini.example,install.bat,README.md,LICENSE -Destination dist\connector-windows\ -ErrorAction SilentlyContinue
+        if (Test-Path "dist\fanexid-connector.exe") {
+          Copy-Item dist\fanexid-connector.exe -Destination dist\connector-windows\
+        }
+        Compress-Archive -Path dist\connector-windows\* -DestinationPath dist\connector-windows.zip -Force
+
+    - name: Upload Windows Release Asset
+      uses: softprops/action-gh-release@v2
+      with:
+        files: dist/connector-windows.zip
+        tag_name: v${{ needs.release.outputs.new_version }}
+
+  build-docker:
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+    - uses: actions/checkout@v5
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Log in to GitHub Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Build and Push Docker Image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        push: true
+        tags: |
+          ghcr.io/${{ github.repository }}:latest
+          ghcr.io/${{ github.repository }}:v${{ needs.release.outputs.new_version }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max

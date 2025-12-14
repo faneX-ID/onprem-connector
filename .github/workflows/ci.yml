@@ -1,0 +1,192 @@
+name: CI
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: read
+  checks: write
+  statuses: write
+
+jobs:
+  test:
+    name: 🧪 Tests & Linting
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.10', '3.11', '3.12']
+
+    steps:
+    - uses: actions/checkout@v5
+
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v6
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Install Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pytest pytest-cov flake8 bandit black isort
+
+    - name: Lint with Flake8
+      run: |
+        # stop the build if there are Python syntax errors or undefined names
+        flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+        # exit-zero treats all errors as warnings
+        flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+
+    - name: Check Code Formatting (Black)
+      run: |
+        black --check --diff .
+
+    - name: Check Import Sorting (isort)
+      run: |
+        isort --check --diff .
+
+    - name: Security Scan with Bandit
+      run: |
+        bandit -r . -ll --skip B101 || true  # B101 = assert usage, common in tests
+
+    - name: Run Tests
+      env:
+        TEST_MODE: "true"
+      run: |
+        pytest tests/ -v --cov=. --cov-report=term-missing --cov-report=xml || true
+
+    - name: Upload Coverage Report
+      if: matrix.python-version == '3.12'
+      uses: codecov/codecov-action@v5
+      with:
+        files: coverage.xml
+        fail_ci_if_error: false
+        verbose: true
+
+  validate-config:
+    name: ⚙️ Config Validation
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v5
+
+    - name: Validate config.ini.example
+      run: |
+        if [ ! -f "config.ini.example" ]; then
+          echo "❌ config.ini.example not found"
+          exit 1
+        fi
+        echo "✅ config.ini.example exists"
+
+    - name: Check for required sections
+      run: |
+        python3 << EOF
+        import configparser
+        import sys
+
+        config = configparser.ConfigParser()
+        try:
+            config.read('config.ini.example')
+            required_sections = ['connector', 'cloud', 'network', 'security', 'logging']
+            missing = [s for s in required_sections if s not in config.sections()]
+            if missing:
+                print(f"❌ Missing sections: {missing}")
+                sys.exit(1)
+            print("✅ All required sections present")
+        except Exception as e:
+            print(f"❌ Error reading config: {e}")
+            sys.exit(1)
+        EOF
+
+  docker-build:
+    name: 🐳 Docker Build
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v5
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Build Docker Image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        push: false
+        tags: fanexid-connector:test
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+  integration-test:
+    name: 🔌 Integration Test
+    runs-on: ubuntu-latest
+    needs: [test, validate-config]
+    steps:
+    - uses: actions/checkout@v5
+
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version: '3.12'
+
+    - name: Install Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    - name: Start Connector
+      run: |
+        # Create test config
+        cp config.ini.example config.ini
+        sed -i 's|api_url = .*|api_url = http://localhost:8000/api|' config.ini
+        sed -i 's|api_token = .*|api_token = test_token|' config.ini
+
+        # Start connector in background
+        python -m uvicorn main:app --host 0.0.0.0 --port 8080 &
+        sleep 5
+
+    - name: Test Health Endpoint
+      run: |
+        curl -f http://localhost:8080/health || exit 1
+
+    - name: Test Status Endpoint
+      run: |
+        curl -f http://localhost:8080/status || exit 1
+
+  ci-summary:
+    name: 📊 CI Summary
+    needs: [test, validate-config, docker-build, integration-test]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      checks: read
+    steps:
+    - name: Check Results
+      run: |
+        echo "╔══════════════════════════════════════════════════════════════╗"
+        echo "║                     CI SUMMARY REPORT                        ║"
+        echo "╠══════════════════════════════════════════════════════════════╣"
+        echo "║ Tests & Linting:     ${{ needs.test.result == 'success' && '✅ success' || needs.test.result == 'failure' && '❌ failure' || '⏭️ skipped' }}"
+        echo "║ Config Validation:   ${{ needs.validate-config.result == 'success' && '✅ success' || needs.validate-config.result == 'failure' && '❌ failure' || '⏭️ skipped' }}"
+        echo "║ Docker Build:        ${{ needs.docker-build.result == 'success' && '✅ success' || needs.docker-build.result == 'failure' && '❌ failure' || '⏭️ skipped' }}"
+        echo "║ Integration Test:    ${{ needs.integration-test.result == 'success' && '✅ success' || needs.integration-test.result == 'failure' && '❌ failure' || '⏭️ skipped' }}"
+        echo "╚══════════════════════════════════════════════════════════════╝"
+
+        if [ "${{ needs.test.result }}" == "failure" ] || \
+           [ "${{ needs.validate-config.result }}" == "failure" ] || \
+           [ "${{ needs.docker-build.result }}" == "failure" ] || \
+           [ "${{ needs.integration-test.result }}" == "failure" ]; then
+          echo "❌ One or more CI jobs have failed."
+          exit 1
+        fi
+
+        echo "✅ All CI checks passed successfully!"

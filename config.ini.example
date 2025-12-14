@@ -1,0 +1,26 @@
+[connector]
+name = MyCompany-Connector
+role = primary
+version = 1.0.0
+
+[cloud]
+api_url = https://fanexid.example.com/api
+api_token = your_secure_token_here
+verify_ssl = true
+timeout = 30
+
+[network]
+listen_host = 0.0.0.0
+listen_port = 8080
+allowed_ips = 10.0.0.0/8,192.168.0.0/16
+
+[security]
+token_refresh_interval = 3600
+max_retries = 3
+retry_delay = 5
+
+[logging]
+level = INFO
+file = logs/connector.log
+max_size = 10MB
+backup_count = 5
