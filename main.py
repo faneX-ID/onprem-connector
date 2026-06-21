@@ -3,7 +3,6 @@ faneX-ID OnPrem Connector
 A lightweight connector bridging on-premises infrastructure with faneX-ID SaaS platform.
 """
 
-import asyncio
 import logging
 import os
 import sys
@@ -13,11 +12,10 @@ from typing import Optional
 import uvicorn
 from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 import httpx
 import configparser
-from datetime import datetime, timedelta
+from datetime import datetime
 
 # Setup logging
 logging.basicConfig(
@@ -256,11 +254,11 @@ async def get_metrics():
     """Prometheus-compatible metrics endpoint."""
     # Basic metrics - extend as needed
     metrics = [
-        f"# HELP fanexid_connector_health Connector health status (1=healthy, 0=unhealthy)",
-        f"# TYPE fanexid_connector_health gauge",
-        f"fanexid_connector_health 1",
-        f"# HELP fanexid_connector_version Connector version",
-        f"# TYPE fanexid_connector_version gauge",
+        "# HELP fanexid_connector_health Connector health status (1=healthy, 0=unhealthy)",
+        "# TYPE fanexid_connector_health gauge",
+        "fanexid_connector_health 1",
+        "# HELP fanexid_connector_version Connector version",
+        "# TYPE fanexid_connector_version gauge",
         f'fanexid_connector_version{{version="{connector_config.version}"}} 1',
     ]
     return "\n".join(metrics)
